@@ -1,8 +1,9 @@
 import socket
 import threading
 import tkinter as tk
-from tkinter import messagebox, filedialog
+from tkinter import messagebox, filedialog, ttk
 import numpy as np
+import time
 
 class MasterNode:
     def __init__(self, host="0.0.0.0", port=5000, broadcast_port=5001):
@@ -10,6 +11,7 @@ class MasterNode:
         self.port = port
         self.broadcast_port = broadcast_port
         self.slave_connections = []
+        self.slave_performance = []
         self.broadcasting = True
         self.window = tk.Tk()
         self.window.title("Master Node")
@@ -86,7 +88,7 @@ class MasterNode:
 
         while True:
             client_socket, address = server_socket.accept()
-            self.slave_connections.append((client_socket, address))
+            self.slave_connections.append(client_socket)  # Only store the client_socket, not the tuple
             self.connection_listbox.insert(tk.END, f"Connected: {address}")
             print(f"New Slave connected from {address}")
 
@@ -124,8 +126,10 @@ class MasterNode:
         extra_rows = rows % num_slaves  # In case rows are not perfectly divisible by number of slaves
         start_row = 0
 
+        self.slave_performance.clear()  # Clear previous performance data
+
         try:
-            for i, (conn, address) in enumerate(self.slave_connections):
+            for i, conn in enumerate(self.slave_connections):  # Iterate directly over the socket connections
                 rows_to_send = sub_matrix_size + (1 if i < extra_rows else 0)
                 sub_matrix_a = matrix_a[start_row:start_row + rows_to_send, :]
                 sub_matrix_shape = sub_matrix_a.shape
@@ -135,17 +139,31 @@ class MasterNode:
                 conn.sendall(f"{sub_matrix_shape[0]},{sub_matrix_shape[1]},{matrix_b_shape[0]},{matrix_b_shape[1]}".encode())
                 conn.recv(1)  # Acknowledgement from Slave
 
+                start_time = time.time()
+
                 # Send matrix data
                 conn.sendall(sub_matrix_a.tobytes())
                 conn.sendall(matrix_b.tobytes())
                 start_row += rows_to_send
 
+                # Record the time before receiving the results
+                self.slave_performance.append({
+                    'address': conn.getpeername(),
+                    'rows': rows_to_send,
+                    'start_time': start_time,
+                    'end_time': None
+                })
+
             results = []
-            for i, (conn, _) in enumerate(self.slave_connections):
-                rows_to_receive = sub_matrix_size + (1 if i < extra_rows else 0)
+            for i, (conn, performance) in enumerate(zip(self.slave_connections, self.slave_performance)):
+                rows_to_receive = performance['rows']
                 data = self.recv_exact(conn, 8 * rows_to_receive * cols)
                 result_sub_matrix = np.frombuffer(data, dtype=np.float64).reshape(rows_to_receive, cols)
                 results.append(result_sub_matrix)
+
+                # Record end time and compute duration
+                performance['end_time'] = time.time()
+                performance['duration'] = performance['end_time'] - performance['start_time']
 
             final_result = np.vstack(results)
             self.show_results(final_result)
@@ -166,18 +184,29 @@ class MasterNode:
     def show_results(self, final_result):
         result_window = tk.Toplevel(self.window)
         result_window.title("Computation Results")
-        result_window.geometry("600x400")
+        result_window.geometry("700x500")
 
         result_frame = tk.Frame(result_window)
         result_frame.pack(fill=tk.BOTH, expand=True)
 
-        result_label = tk.Label(result_frame, text="Matrix Multiplication Result", font=("Arial", 14))
+        result_label = tk.Label(result_frame, text="Matrix Multiplication Results", font=("Arial", 14))
         result_label.pack(pady=10)
 
-        result_text = tk.Text(result_frame, wrap=tk.WORD, font=("Courier", 10))
-        result_text.pack(expand=True, fill=tk.BOTH)
+        # Table for displaying each slave's performance
+        columns = ("Address", "Rows Processed", "Time Taken (s)")
+        tree = ttk.Treeview(result_frame, columns=columns, show="headings")
+        tree.heading("Address", text="PC Address")
+        tree.heading("Rows Processed", text="Rows Processed")
+        tree.heading("Time Taken (s)", text="Time Taken (s)")
 
-        result_text.insert(tk.END, np.array2string(final_result, separator=', '))
+        for performance in self.slave_performance:
+            tree.insert("", "end", values=(
+                performance['address'],
+                performance['rows'],
+                f"{performance['duration']:.4f}"
+            ))
+
+        tree.pack(expand=True, fill=tk.BOTH, padx=10, pady=10)
 
         button_frame = tk.Frame(result_window)
         button_frame.pack(fill=tk.X, pady=10)
