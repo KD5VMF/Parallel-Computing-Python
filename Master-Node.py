@@ -1,34 +1,71 @@
 import socket
 import threading
 import tkinter as tk
-from tkinter import messagebox
+from tkinter import messagebox, filedialog
 import numpy as np
 
 class MasterNode:
-    def __init__(self, host="0.0.0.0", port=5000):
+    def __init__(self, host="0.0.0.0", port=5000, broadcast_port=5001):
         self.host = host
         self.port = port
+        self.broadcast_port = broadcast_port
         self.slave_connections = []
+        self.broadcasting = True
         self.window = tk.Tk()
         self.window.title("Master Node")
+        self.window.geometry("400x300")
+        self.window.resizable(False, False)
 
-        self.info_label = tk.Label(self.window, text=f"IP: {self.get_ip_address()} | Port: {self.port}")
-        self.info_label.pack()
+        # Create main frame
+        main_frame = tk.Frame(self.window, padx=10, pady=10)
+        main_frame.pack(fill=tk.BOTH, expand=True)
 
-        self.connection_listbox = tk.Listbox(self.window)
-        self.connection_listbox.pack()
+        # Server info section
+        server_frame = tk.LabelFrame(main_frame, text="Server Info", padx=10, pady=10)
+        server_frame.pack(fill=tk.BOTH, expand=True)
+
+        self.info_label = tk.Label(server_frame, text=f"IP: {self.get_ip_address()} | Port: {self.port}")
+        self.info_label.pack(anchor="w")
+
+        # Connected slaves section
+        connection_frame = tk.LabelFrame(main_frame, text="Connected Slaves", padx=10, pady=10)
+        connection_frame.pack(fill=tk.BOTH, expand=True)
+
+        self.connection_listbox = tk.Listbox(connection_frame, height=5)
+        self.connection_listbox.pack(fill=tk.BOTH, expand=True)
+
+        # Matrix size and control buttons
+        control_frame = tk.Frame(main_frame, padx=10, pady=10)
+        control_frame.pack(fill=tk.BOTH, expand=True)
+
+        matrix_size_label = tk.Label(control_frame, text="Matrix Size (NxN):")
+        matrix_size_label.grid(row=0, column=0, sticky="w")
 
         self.matrix_size_var = tk.StringVar(value="1024x1024")
-        self.matrix_entry = tk.Entry(self.window, textvariable=self.matrix_size_var)
-        self.matrix_entry.pack()
+        self.matrix_entry = tk.Entry(control_frame, textvariable=self.matrix_size_var, width=10)
+        self.matrix_entry.grid(row=0, column=1, sticky="e")
 
-        self.ready_button = tk.Button(self.window, text="Ready", command=self.ready)
-        self.ready_button.pack()
+        self.ready_button = tk.Button(control_frame, text="Ready", command=self.ready)
+        self.ready_button.grid(row=1, column=0, pady=5)
 
-        self.go_button = tk.Button(self.window, text="Go", command=self.start_computation)
-        self.go_button.pack()
+        self.go_button = tk.Button(control_frame, text="Go", command=self.start_computation)
+        self.go_button.grid(row=1, column=1, pady=5)
+        self.go_button.config(state=tk.DISABLED)
 
         threading.Thread(target=self.start_server).start()
+        threading.Thread(target=self.broadcast_hello).start()  # Start broadcasting "hello" messages
+
+        # Bind keys for exit
+        self.window.bind('<F8>', self.exit_program)
+        self.window.bind('<Control-x>', self.exit_program)
+
+    def exit_program(self, event=None):
+        self.broadcasting = False
+        self.window.destroy()
+        for conn, _ in self.slave_connections:
+            conn.close()
+        print("Master Node exited.")
+        exit(0)
 
     def get_ip_address(self):
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -53,10 +90,23 @@ class MasterNode:
             self.connection_listbox.insert(tk.END, f"Connected: {address}")
             print(f"New Slave connected from {address}")
 
+    def broadcast_hello(self):
+        broadcast_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+        broadcast_socket.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+
+        message = f"{self.get_ip_address()}:{self.port}"
+        while self.broadcasting:
+            broadcast_socket.sendto(message.encode(), ('<broadcast>', self.broadcast_port))
+            print(f"Broadcasting hello: {message}")
+            threading.Event().wait(2)  # Broadcast every 2 seconds
+
     def ready(self):
         if len(self.slave_connections) == 0:
             messagebox.showwarning("Warning", "No Slaves connected!")
         else:
+            self.broadcasting = False  # Stop broadcasting
+            self.ready_button.config(state=tk.DISABLED)
+            self.go_button.config(state=tk.NORMAL)
             messagebox.showinfo("Info", "Ready to start the computation!")
 
     def start_computation(self):
@@ -69,23 +119,91 @@ class MasterNode:
         matrix_a = np.random.rand(rows, cols)
         matrix_b = np.random.rand(cols, rows)
 
-        sub_matrix_size = rows // len(self.slave_connections)
+        num_slaves = len(self.slave_connections)
+        sub_matrix_size = rows // num_slaves
+        extra_rows = rows % num_slaves  # In case rows are not perfectly divisible by number of slaves
         start_row = 0
 
-        for conn, address in self.slave_connections:
-            sub_matrix_a = matrix_a[start_row:start_row + sub_matrix_size, :]
-            conn.sendall(sub_matrix_a.tobytes())
-            conn.sendall(matrix_b.tobytes())
-            start_row += sub_matrix_size
+        try:
+            for i, (conn, address) in enumerate(self.slave_connections):
+                rows_to_send = sub_matrix_size + (1 if i < extra_rows else 0)
+                sub_matrix_a = matrix_a[start_row:start_row + rows_to_send, :]
+                sub_matrix_shape = sub_matrix_a.shape
+                matrix_b_shape = matrix_b.shape
 
-        results = []
-        for conn, _ in self.slave_connections:
-            data = conn.recv(4096)
-            result_sub_matrix = np.frombuffer(data, dtype=np.float64).reshape(sub_matrix_size, rows)
-            results.append(result_sub_matrix)
+                # Send matrix shapes first
+                conn.sendall(f"{sub_matrix_shape[0]},{sub_matrix_shape[1]},{matrix_b_shape[0]},{matrix_b_shape[1]}".encode())
+                conn.recv(1)  # Acknowledgement from Slave
 
-        final_result = np.vstack(results)
-        messagebox.showinfo("Info", f"Matrix multiplication completed.\nResult: {final_result}")
+                # Send matrix data
+                conn.sendall(sub_matrix_a.tobytes())
+                conn.sendall(matrix_b.tobytes())
+                start_row += rows_to_send
+
+            results = []
+            for i, (conn, _) in enumerate(self.slave_connections):
+                rows_to_receive = sub_matrix_size + (1 if i < extra_rows else 0)
+                data = self.recv_exact(conn, 8 * rows_to_receive * cols)
+                result_sub_matrix = np.frombuffer(data, dtype=np.float64).reshape(rows_to_receive, cols)
+                results.append(result_sub_matrix)
+
+            final_result = np.vstack(results)
+            self.show_results(final_result)
+
+        except Exception as e:
+            messagebox.showerror("Error", f"An error occurred during computation: {e}")
+
+    def recv_exact(self, conn, size):
+        """Ensure that we receive exactly `size` bytes from the connection."""
+        buffer = bytearray()
+        while len(buffer) < size:
+            packet = conn.recv(size - len(buffer))
+            if not packet:
+                break
+            buffer.extend(packet)
+        return buffer
+
+    def show_results(self, final_result):
+        result_window = tk.Toplevel(self.window)
+        result_window.title("Computation Results")
+        result_window.geometry("600x400")
+
+        result_frame = tk.Frame(result_window)
+        result_frame.pack(fill=tk.BOTH, expand=True)
+
+        result_label = tk.Label(result_frame, text="Matrix Multiplication Result", font=("Arial", 14))
+        result_label.pack(pady=10)
+
+        result_text = tk.Text(result_frame, wrap=tk.WORD, font=("Courier", 10))
+        result_text.pack(expand=True, fill=tk.BOTH)
+
+        result_text.insert(tk.END, np.array2string(final_result, separator=', '))
+
+        button_frame = tk.Frame(result_window)
+        button_frame.pack(fill=tk.X, pady=10)
+
+        save_button = tk.Button(button_frame, text="Save Results", command=lambda: self.save_results(final_result))
+        save_button.pack(side=tk.LEFT, padx=10)
+
+        close_button = tk.Button(button_frame, text="Close", command=lambda: self.close_results_window(result_window))
+        close_button.pack(side=tk.RIGHT, padx=10)
+
+    def save_results(self, final_result):
+        file_path = filedialog.asksaveasfilename(defaultextension=".txt", filetypes=[("Text Files", "*.txt"), ("All Files", "*.*")])
+        if file_path:
+            with open(file_path, 'w') as file:
+                file.write(np.array2string(final_result, separator=', '))
+            messagebox.showinfo("Saved", f"Results saved to {file_path}")
+
+    def close_results_window(self, window):
+        window.destroy()
+        self.reset_for_new_task()
+
+    def reset_for_new_task(self):
+        messagebox.showinfo("Ready", "The system is ready for a new task.")
+        self.connection_listbox.delete(0, tk.END)
+        self.start_server()  # Restart server to accept new connections
+        threading.Thread(target=self.broadcast_hello).start()  # Resume broadcasting "hello" messages
 
     def run(self):
         self.window.mainloop()
