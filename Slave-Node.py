@@ -2,6 +2,7 @@ import socket
 import numpy as np
 import threading
 import keyboard  # Requires the 'keyboard' library
+import time
 
 class SlaveNode:
     def __init__(self, broadcast_port=5001):
@@ -63,19 +64,25 @@ class SlaveNode:
                     print(f"Matrix B received: {matrix_b_size * 8} bytes")
 
                     print("Starting matrix multiplication...")
-                    sub_matrix_a = np.frombuffer(sub_matrix_a_data, dtype=np.float64).reshape((sub_matrix_a_rows, sub_matrix_a_cols))
-                    matrix_b = np.frombuffer(matrix_b_data, dtype=np.float64).reshape((matrix_b_rows, matrix_b_cols))
+                    start_time = time.time()  # Start timing before computation
 
                     # Perform matrix multiplication
+                    sub_matrix_a = np.frombuffer(sub_matrix_a_data, dtype=np.float64).reshape((sub_matrix_a_rows, sub_matrix_a_cols))
+                    matrix_b = np.frombuffer(matrix_b_data, dtype=np.float64).reshape((matrix_b_rows, matrix_b_cols))
                     result = np.dot(sub_matrix_a, matrix_b)
-                    print("Matrix multiplication done. Returning results...")
 
-                    if self.send_results(result):
-                        print("Results returned successfully.")
+                    end_time = time.time()  # End timing after computation
+                    computation_time = end_time - start_time
+
+                    print(f"Matrix multiplication done in {computation_time:.4f} seconds. Returning results...")
+
+                    # Send the result and computation time back to the Master
+                    if self.send_results(result, computation_time):
+                        print("Results and time returned successfully.")
                     else:
-                        print("Failed to return results. Retrying...")
-                        if self.send_results(result):
-                            print("Retry successful. Results returned.")
+                        print("Failed to return results and time. Retrying...")
+                        if self.send_results(result, computation_time):
+                            print("Retry successful. Results and time returned.")
                         else:
                             print("Retry failed. Aborting operation.")
 
@@ -95,10 +102,11 @@ class SlaveNode:
             buffer.extend(packet)
         return buffer
 
-    def send_results(self, result):
-        """Send the result back to the Master, with a simple retry mechanism."""
+    def send_results(self, result, computation_time):
+        """Send the result and computation time back to the Master."""
         try:
-            self.sock.sendall(result.tobytes())
+            self.sock.sendall(result.tobytes())  # Send the result matrix
+            self.sock.sendall(np.array([computation_time], dtype=np.float64).tobytes())  # Send the time taken as a float64
             return True
         except Exception as e:
             print(f"Error sending results: {e}")
