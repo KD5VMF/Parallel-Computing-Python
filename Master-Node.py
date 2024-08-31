@@ -3,7 +3,6 @@ import threading
 import tkinter as tk
 from tkinter import messagebox, filedialog, ttk
 import numpy as np
-import time
 
 class MasterNode:
     def __init__(self, host="0.0.0.0", port=5000, broadcast_port=5001):
@@ -64,7 +63,7 @@ class MasterNode:
     def exit_program(self, event=None):
         self.broadcasting = False
         self.window.destroy()
-        for conn, _ in self.slave_connections:
+        for conn in self.slave_connections:
             conn.close()
         print("Master Node exited.")
         exit(0)
@@ -135,23 +134,18 @@ class MasterNode:
                 sub_matrix_shape = sub_matrix_a.shape
                 matrix_b_shape = matrix_b.shape
 
-                # Send matrix shapes first
                 conn.sendall(f"{sub_matrix_shape[0]},{sub_matrix_shape[1]},{matrix_b_shape[0]},{matrix_b_shape[1]}".encode())
                 conn.recv(1)  # Acknowledgement from Slave
 
-                start_time = time.time()
-
-                # Send matrix data
                 conn.sendall(sub_matrix_a.tobytes())
                 conn.sendall(matrix_b.tobytes())
                 start_row += rows_to_send
 
-                # Record the time before receiving the results
+                # Record the number of rows assigned to each Slave
                 self.slave_performance.append({
                     'address': conn.getpeername(),
                     'rows': rows_to_send,
-                    'start_time': start_time,
-                    'end_time': None
+                    'computation_time': None  # Placeholder for the computation time to be filled later
                 })
 
             results = []
@@ -161,9 +155,10 @@ class MasterNode:
                 result_sub_matrix = np.frombuffer(data, dtype=np.float64).reshape(rows_to_receive, cols)
                 results.append(result_sub_matrix)
 
-                # Record end time and compute duration
-                performance['end_time'] = time.time()
-                performance['duration'] = performance['end_time'] - performance['start_time']
+                # Receive the computation time from the Slave
+                time_data = self.recv_exact(conn, 8)  # Receive the time as a float64 (8 bytes)
+                computation_time = np.frombuffer(time_data, dtype=np.float64)[0]
+                performance['computation_time'] = computation_time
 
             final_result = np.vstack(results)
             self.show_results(final_result)
@@ -203,7 +198,7 @@ class MasterNode:
             tree.insert("", "end", values=(
                 performance['address'],
                 performance['rows'],
-                f"{performance['duration']:.4f}"
+                f"{performance['computation_time']:.4f}"
             ))
 
         tree.pack(expand=True, fill=tk.BOTH, padx=10, pady=10)
