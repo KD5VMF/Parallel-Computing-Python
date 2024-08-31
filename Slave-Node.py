@@ -10,7 +10,18 @@ class SlaveNode:
         self.master_port = None
         self.sock = None
         self.broadcast_port = broadcast_port
-        self.listen_for_master()
+        self.running = True
+        self.connect_to_master()
+
+    def connect_to_master(self):
+        while self.running:
+            try:
+                self.listen_for_master()
+                self.listen_for_tasks()
+            except (ConnectionResetError, ConnectionRefusedError, socket.error) as e:
+                print(f"Connection error: {e}. Reconnecting...")
+                time.sleep(2)
+                continue
 
     def listen_for_master(self):
         broadcast_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
@@ -18,82 +29,78 @@ class SlaveNode:
         broadcast_socket.bind(("", self.broadcast_port))
 
         print("Listening for broadcast from Master...")
-        while True:
+        while self.running:
             data, addr = broadcast_socket.recvfrom(1024)
             message = data.decode()
             self.master_ip, self.master_port = message.split(':')
             self.master_port = int(self.master_port)
             print(f"Received broadcast from Master: {self.master_ip}:{self.master_port}")
-            self.connect_to_master()
-            break  # Stop listening once connected to a Master
-
-    def connect_to_master(self):
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.sock.connect((self.master_ip, self.master_port))
-        print(f"Connected to Master at {self.master_ip}:{self.master_port}")
-        self.listen_for_tasks()
+            self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.sock.connect((self.master_ip, self.master_port))
+            print(f"Connected to Master at {self.master_ip}:{self.master_port}")
+            break
 
     def listen_for_exit(self):
         def check_for_exit():
             while True:
                 if keyboard.is_pressed('F8') or keyboard.is_pressed('ctrl+x'):
                     print("Slave Node exiting...")
-                    self.sock.close()
+                    self.running = False
+                    if self.sock:
+                        self.sock.close()
                     exit(0)
         threading.Thread(target=check_for_exit, daemon=True).start()
 
     def listen_for_tasks(self):
+        self.listen_for_exit()
         try:
-            while True:
+            while self.running:
                 print("Waiting for work packets...")
                 data = self.sock.recv(1024)  # Receive the matrix dimensions first
-                if data:
-                    print(f"Data packet received: {data.decode()}")
-                    sub_matrix_a_rows, sub_matrix_a_cols, matrix_b_rows, matrix_b_cols = map(int, data.decode().split(','))
-                    self.sock.sendall(b'1')  # Acknowledgement to Master
+                if not data:
+                    print("Disconnected from Master.")
+                    break
+                print(f"Data packet received: {data.decode()}")
+                sub_matrix_a_rows, sub_matrix_a_cols, matrix_b_rows, matrix_b_cols = map(int, data.decode().split(','))
+                self.sock.sendall(b'1')  # Acknowledgement to Master
 
-                    print("Receiving matrix data...")
-                    # Receive the actual matrix data
-                    sub_matrix_a_size = sub_matrix_a_rows * sub_matrix_a_cols
-                    matrix_b_size = matrix_b_rows * matrix_b_cols
+                print("Receiving matrix data...")
+                sub_matrix_a_size = sub_matrix_a_rows * sub_matrix_a_cols
+                matrix_b_size = matrix_b_rows * matrix_b_cols
 
-                    sub_matrix_a_data = self.recv_exact(8 * sub_matrix_a_size)
-                    print(f"Matrix A received: {sub_matrix_a_size * 8} bytes")
+                sub_matrix_a_data = self.recv_exact(8 * sub_matrix_a_size)
+                print(f"Matrix A received: {sub_matrix_a_size * 8} bytes")
 
-                    matrix_b_data = self.recv_exact(8 * matrix_b_size)
-                    print(f"Matrix B received: {matrix_b_size * 8} bytes")
+                matrix_b_data = self.recv_exact(8 * matrix_b_size)
+                print(f"Matrix B received: {matrix_b_size * 8} bytes")
 
-                    print("Starting matrix multiplication...")
-                    start_time = time.time()  # Start timing before computation
+                print("Starting matrix multiplication...")
+                start_time = time.time()
 
-                    # Perform matrix multiplication
-                    sub_matrix_a = np.frombuffer(sub_matrix_a_data, dtype=np.float64).reshape((sub_matrix_a_rows, sub_matrix_a_cols))
-                    matrix_b = np.frombuffer(matrix_b_data, dtype=np.float64).reshape((matrix_b_rows, matrix_b_cols))
-                    result = np.dot(sub_matrix_a, matrix_b)
+                sub_matrix_a = np.frombuffer(sub_matrix_a_data, dtype=np.float64).reshape((sub_matrix_a_rows, sub_matrix_a_cols))
+                matrix_b = np.frombuffer(matrix_b_data, dtype=np.float64).reshape((matrix_b_rows, matrix_b_cols))
+                result = np.dot(sub_matrix_a, matrix_b)
 
-                    end_time = time.time()  # End timing after computation
-                    computation_time = end_time - start_time
+                end_time = time.time()
+                computation_time = end_time - start_time
 
-                    print(f"Matrix multiplication done in {computation_time:.4f} seconds. Returning results...")
+                print(f"Matrix multiplication done in {computation_time:.4f} seconds. Returning results...")
 
-                    # Send the result and computation time back to the Master
+                if self.send_results(result, computation_time):
+                    print("Results and time returned successfully.")
+                else:
+                    print("Failed to return results and time. Retrying...")
                     if self.send_results(result, computation_time):
-                        print("Results and time returned successfully.")
+                        print("Retry successful. Results and time returned.")
                     else:
-                        print("Failed to return results and time. Retrying...")
-                        if self.send_results(result, computation_time):
-                            print("Retry successful. Results and time returned.")
-                        else:
-                            print("Retry failed. Aborting operation.")
+                        print("Retry failed. Aborting operation.")
 
-                    print("*" * 40)
+                print("*" * 40)
 
-        except Exception as e:
-            print(f"Error occurred: {e}")
-            self.sock.close()
+        except (ConnectionResetError, ConnectionRefusedError, socket.error) as e:
+            print(f"Connection error: {e}. Reconnecting...")
 
     def recv_exact(self, size):
-        """Ensure that we receive exactly `size` bytes from the connection."""
         buffer = bytearray()
         while len(buffer) < size:
             packet = self.sock.recv(size - len(buffer))
@@ -103,7 +110,6 @@ class SlaveNode:
         return buffer
 
     def send_results(self, result, computation_time):
-        """Send the result and computation time back to the Master."""
         try:
             self.sock.sendall(result.tobytes())  # Send the result matrix
             self.sock.sendall(np.array([computation_time], dtype=np.float64).tobytes())  # Send the time taken as a float64
@@ -114,3 +120,4 @@ class SlaveNode:
 
 if __name__ == "__main__":
     slave = SlaveNode()
+    slave.connect_to_master()
