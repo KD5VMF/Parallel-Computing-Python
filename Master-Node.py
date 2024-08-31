@@ -12,6 +12,7 @@ class MasterNode:
         self.slave_connections = []
         self.slave_performance = []
         self.broadcasting = True
+        self.running = True
         self.window = tk.Tk()
         self.window.title("Master Node")
         self.window.geometry("400x300")
@@ -53,8 +54,12 @@ class MasterNode:
         self.go_button.grid(row=1, column=1, pady=5)
         self.go_button.config(state=tk.DISABLED)
 
-        threading.Thread(target=self.start_server).start()
-        threading.Thread(target=self.broadcast_hello).start()  # Start broadcasting "hello" messages
+        self.server_socket = None
+        self.accept_connections_thread = None
+
+        # Start the server and broadcast
+        self.start_server()
+        self.broadcast_hello()
 
         # Bind keys for exit
         self.window.bind('<F8>', self.exit_program)
@@ -62,9 +67,12 @@ class MasterNode:
 
     def exit_program(self, event=None):
         self.broadcasting = False
+        self.running = False
         self.window.destroy()
         for conn in self.slave_connections:
             conn.close()
+        if self.server_socket:
+            self.server_socket.close()
         print("Master Node exited.")
         exit(0)
 
@@ -80,32 +88,40 @@ class MasterNode:
         return ip
 
     def start_server(self):
-        server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        server_socket.bind((self.host, self.port))
-        server_socket.listen(5)
+        self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.server_socket.bind((self.host, self.port))
+        self.server_socket.listen(5)
         print(f"Master Node is listening on {self.host}:{self.port}")
 
-        while True:
-            client_socket, address = server_socket.accept()
-            self.slave_connections.append(client_socket)  # Only store the client_socket, not the tuple
-            self.connection_listbox.insert(tk.END, f"Connected: {address}")
-            print(f"New Slave connected from {address}")
+        # Start the thread to accept connections
+        self.accept_connections_thread = threading.Thread(target=self.accept_connections)
+        self.accept_connections_thread.start()
+
+    def accept_connections(self):
+        while self.running:
+            try:
+                client_socket, address = self.server_socket.accept()
+                self.slave_connections.append(client_socket)
+                self.connection_listbox.insert(tk.END, f"Connected: {address}")
+                print(f"New Slave connected from {address}")
+            except OSError:
+                break
 
     def broadcast_hello(self):
         broadcast_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
         broadcast_socket.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
 
         message = f"{self.get_ip_address()}:{self.port}"
-        while self.broadcasting:
+        if self.broadcasting:
             broadcast_socket.sendto(message.encode(), ('<broadcast>', self.broadcast_port))
             print(f"Broadcasting hello: {message}")
-            threading.Event().wait(2)  # Broadcast every 2 seconds
+        self.window.after(2000, self.broadcast_hello)  # Broadcast every 2 seconds
 
     def ready(self):
         if len(self.slave_connections) == 0:
             messagebox.showwarning("Warning", "No Slaves connected!")
         else:
-            self.broadcasting = False  # Stop broadcasting
+            self.broadcasting = False
             self.ready_button.config(state=tk.DISABLED)
             self.go_button.config(state=tk.NORMAL)
             messagebox.showinfo("Info", "Ready to start the computation!")
@@ -122,52 +138,53 @@ class MasterNode:
 
         num_slaves = len(self.slave_connections)
         sub_matrix_size = rows // num_slaves
-        extra_rows = rows % num_slaves  # In case rows are not perfectly divisible by number of slaves
+        extra_rows = rows % num_slaves
         start_row = 0
 
-        self.slave_performance.clear()  # Clear previous performance data
+        self.slave_performance.clear()
 
         try:
-            for i, conn in enumerate(self.slave_connections):  # Iterate directly over the socket connections
+            for i, conn in enumerate(self.slave_connections):
                 rows_to_send = sub_matrix_size + (1 if i < extra_rows else 0)
                 sub_matrix_a = matrix_a[start_row:start_row + rows_to_send, :]
-                sub_matrix_shape = sub_matrix_a.shape
-                matrix_b_shape = matrix_b.shape
-
-                conn.sendall(f"{sub_matrix_shape[0]},{sub_matrix_shape[1]},{matrix_b_shape[0]},{matrix_b_shape[1]}".encode())
-                conn.recv(1)  # Acknowledgement from Slave
-
-                conn.sendall(sub_matrix_a.tobytes())
-                conn.sendall(matrix_b.tobytes())
                 start_row += rows_to_send
 
-                # Record the number of rows assigned to each Slave
-                self.slave_performance.append({
-                    'address': conn.getpeername(),
-                    'rows': rows_to_send,
-                    'computation_time': None  # Placeholder for the computation time to be filled later
-                })
+                self.send_data_to_slave(conn, sub_matrix_a, matrix_b, rows_to_send)
 
-            results = []
-            for i, (conn, performance) in enumerate(zip(self.slave_connections, self.slave_performance)):
-                rows_to_receive = performance['rows']
-                data = self.recv_exact(conn, 8 * rows_to_receive * cols)
-                result_sub_matrix = np.frombuffer(data, dtype=np.float64).reshape(rows_to_receive, cols)
-                results.append(result_sub_matrix)
-
-                # Receive the computation time from the Slave
-                time_data = self.recv_exact(conn, 8)  # Receive the time as a float64 (8 bytes)
-                computation_time = np.frombuffer(time_data, dtype=np.float64)[0]
-                performance['computation_time'] = computation_time
-
-            final_result = np.vstack(results)
+            final_result = np.vstack([performance['result'] for performance in self.slave_performance])
             self.show_results(final_result)
 
         except Exception as e:
             messagebox.showerror("Error", f"An error occurred during computation: {e}")
 
+    def send_data_to_slave(self, conn, sub_matrix_a, matrix_b, rows_to_send):
+        sub_matrix_shape = sub_matrix_a.shape
+        matrix_b_shape = matrix_b.shape
+
+        try:
+            conn.sendall(f"{sub_matrix_shape[0]},{sub_matrix_shape[1]},{matrix_b_shape[0]},{matrix_b_shape[1]}".encode())
+            conn.recv(1)  # Acknowledgement
+
+            conn.sendall(sub_matrix_a.tobytes())
+            conn.sendall(matrix_b.tobytes())
+
+            result = self.recv_exact(conn, 8 * rows_to_send * matrix_b_shape[1])
+            result_matrix = np.frombuffer(result, dtype=np.float64).reshape(rows_to_send, matrix_b_shape[1])
+
+            time_data = self.recv_exact(conn, 8)
+            computation_time = np.frombuffer(time_data, dtype=np.float64)[0]
+
+            self.slave_performance.append({
+                'address': conn.getpeername(),
+                'rows': rows_to_send,
+                'result': result_matrix,
+                'computation_time': computation_time
+            })
+
+        except Exception as e:
+            print(f"Error sending data to Slave {conn.getpeername()}: {e}")
+
     def recv_exact(self, conn, size):
-        """Ensure that we receive exactly `size` bytes from the connection."""
         buffer = bytearray()
         while len(buffer) < size:
             packet = conn.recv(size - len(buffer))
@@ -187,7 +204,6 @@ class MasterNode:
         result_label = tk.Label(result_frame, text="Matrix Multiplication Results", font=("Arial", 14))
         result_label.pack(pady=10)
 
-        # Table for displaying each slave's performance
         columns = ("Address", "Rows Processed", "Time Taken (s)")
         tree = ttk.Treeview(result_frame, columns=columns, show="headings")
         tree.heading("Address", text="PC Address")
@@ -221,13 +237,14 @@ class MasterNode:
 
     def close_results_window(self, window):
         window.destroy()
-        self.reset_for_new_task()
-
-    def reset_for_new_task(self):
-        messagebox.showinfo("Ready", "The system is ready for a new task.")
+        for conn in self.slave_connections:
+            conn.close()
+        self.slave_connections.clear()
         self.connection_listbox.delete(0, tk.END)
+        self.broadcasting = True
         self.start_server()  # Restart server to accept new connections
-        threading.Thread(target=self.broadcast_hello).start()  # Resume broadcasting "hello" messages
+        self.broadcast_hello()
+        messagebox.showinfo("Ready", "The system is ready for new connections.")
 
     def run(self):
         self.window.mainloop()
